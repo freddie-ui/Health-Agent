@@ -1,135 +1,103 @@
-import Airtable from 'airtable';
-import twilio from 'twilio';
+// api/whatsapp.js
 
-export const config = { api: { bodyParser: false } };
-
-const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
-
-// Airtable init
-const base = new Airtable({ apiKey: process.env.AIRTABLE_API_KEY }).base(process.env.AIRTABLE_BASE_ID);
-const tableName = process.env.AIRTABLE_TABLE_NAME || 'Daily Logs';
-
-// Helper: parse application/x-www-form-urlencoded without extra deps
+// --- helpers that don't touch env vars ---
 async function parseForm(req) {
   const chunks = [];
-  for await (const chunk of req) chunks.push(chunk);
+  for await (const c of req) chunks.push(c);
   const raw = Buffer.concat(chunks).toString('utf8');
   const params = new URLSearchParams(raw);
   return Object.fromEntries(params.entries());
 }
 
-// Optional Twilio signature validation
-function validateTwilioSignature(req, body) {
-  try {
-    if (process.env.TWILIO_VALIDATE !== 'true') return true;
-    const sig = req.headers['x-twilio-signature'];
-    if (!sig) return false;
-    const url = process.env.TWILIO_WEBHOOK_URL; // must match exactly as in Twilio console
-    if (!url) return false;
-    const validator = twilio.validateRequest;
-    return validator(process.env.TWILIO_AUTH_TOKEN, sig, url, body);
-  } catch (_) { return false; }
-}
+function parseAM(text){ const t=text.replace(/\s+/g,' ').trim(); const r={EntryType:'AM'};
+  const s=t.match(/Sleep\s+(\d{1,2}(?:\.\d+)?)\s*h/i); if(s) r.SleepHours=parseFloat(s[1]);
+  const m=t.match(/Mood\s+([1-5])/i); if(m) r.Mood=parseInt(m[1]);
+  const e=t.match(/Energy\s+([1-5])/i); if(e) r.Energy=parseInt(e[1]);
+  const n=t.match(/Notes:\s*(.*)$/i); if(n) r.Notes=n[1].trim(); return r; }
 
-// ---- Parsing logic ----
-function parseAM(bodyText) {
-  // Example: "Sleep 7.5h | Mood 4 | Energy 3 | Notes: travel"
-  const t = bodyText.replace(/\s+/g, ' ').trim();
-  const result = { EntryType: 'AM' };
+function parsePM(text){ const t=text.replace(/\s+/g,' ').trim(); const r={EntryType:'PM'};
+  const tr=t.match(/Training\s+([SCMR])\s*@RPE\s*(\d{1,2})/i); if(tr){r.TrainingType=tr[1].toUpperCase(); r.RPE=parseInt(tr[2]);}
+  const steps=t.match(/Steps\s+(\d+)/i); if(steps) r.Steps=parseInt(steps[1]);
+  const protein=t.match(/Protein\s+(\d{1,4})\s*g/i); if(protein) r.Protein_g=parseInt(protein[1]);
+  const fiber=t.match(/Fiber\s+(\d{1,4})\s*g/i); if(fiber) r.Fiber_g=parseInt(fiber[1]);
+  const water=t.match(/Water\s+(\d{1,2}(?:\.\d+)?)\s*L/i); if(water) r.Water_L=parseFloat(water[1]);
+  const caffeine=t.match(/Caffeine\s+(\d{1,4})\s*mg/i); if(caffeine) r.Caffeine_mg=parseInt(caffeine[1]);
+  const after=t.match(/after14:00\s+(Y|N)/i); if(after) r.CaffeineAfter2pm=after[1].toUpperCase();
+  const alcohol=t.match(/Alcohol\s+(\d+(?:\.\d+)?)\s*units?/i); if(alcohol) r.Alcohol_units=parseFloat(alcohol[1]);
+  const gi=t.match(/GI\s+([^|]+)/i); if(gi) r.GI_Symptoms=gi[1].trim();
+  const supp=t.match(/Supplements\/Creatine\s+([^|]+)/i); if(supp) r.Supplements=supp[1].trim();
+  const flags=t.match(/Flags\s+(.+)$/i); if(flags) r.Flags=flags[1].trim(); return r; }
 
-  const sleep = t.match(/Sleep\s+(\d{1,2}(?:\.\d+)?)\s*h/i);
-  if (sleep) result.SleepHours = parseFloat(sleep[1]);
+function detectEntryType(text){ if(/^AM[:\-]/i.test(text))return 'AM'; if(/^PM[:\-]/i.test(text))return 'PM';
+  if(/\bSleep\b/i.test(text))return 'AM'; if(/\bTraining\b/i.test(text))return 'PM'; return 'UNKNOWN'; }
 
-  const mood = t.match(/Mood\s+([1-5])/i);   if (mood)   result.Mood = parseInt(mood[1]);
-  const energy = t.match(/Energy\s+([1-5])/i); if (energy) result.Energy = parseInt(energy[1]);
+function todayISO(tz='Europe/London'){ const now=new Date();
+  const f=new Intl.DateTimeFormat('en-CA',{timeZone:tz,year:'numeric',month:'2-digit',day:'2-digit'});
+  const [{value:y},,{value:m},,{value:d}]=f.formatToParts(now); return `${y}-${m}-${d}`; }
 
-  const notes = t.match(/Notes:\s*(.*)$/i);  if (notes)  result.Notes = notes[1].trim();
-  return result;
-}
-
-function parsePM(bodyText) {
-  // Example: "Training S @RPE 7 | Steps 10500 | Protein 160g | Fiber 30g | Water 3L | Caffeine 120mg after14:00 N | Alcohol 1 units | GI none | Supplements/Creatine 5g | Flags Travel"
-  const t = bodyText.replace(/\s+/g, ' ').trim();
-  const result = { EntryType: 'PM' };
-
-  const train = t.match(/Training\s+([SCMR])\s*@RPE\s*(\d{1,2})/i);
-  if (train) { result.TrainingType = train[1].toUpperCase(); result.RPE = parseInt(train[2]); }
-
-  const steps = t.match(/Steps\s+(\d+)/i);
-  if (steps) result.Steps = parseInt(steps[1]);
-
-  const protein = t.match(/Protein\s+(\d{1,4})\s*g/i); if (protein) result.Protein_g = parseInt(protein[1]);
-  const fiber = t.match(/Fiber\s+(\d{1,4})\s*g/i); if (fiber) result.Fiber_g = parseInt(fiber[1]);
-  const water = t.match(/Water\s+(\d{1,2}(?:\.\d+)?)\s*L/i); if (water) result.Water_L = parseFloat(water[1]);
-  const caffeine = t.match(/Caffeine\s+(\d{1,4})\s*mg/i); if (caffeine) result.Caffeine_mg = parseInt(caffeine[1]);
-  const after = t.match(/after14:00\s+(Y|N)/i); if (after) result.CaffeineAfter2pm = after[1].toUpperCase();
-  const alcohol = t.match(/Alcohol\s+(\d+(?:\.\d+)?)\s*units?/i); if (alcohol) result.Alcohol_units = parseFloat(alcohol[1]);
-  const gi = t.match(/GI\s+([^|]+)/i); if (gi) result.GI_Symptoms = gi[1].trim();
-  const supp = t.match(/Supplements\/Creatine\s+([^|]+)/i); if (supp) result.Supplements = supp[1].trim();
-  const flags = t.match(/Flags\s+(.+)$/i); if (flags) result.Flags = flags[1].trim();
-  return result;
-}
-
-function detectEntryType(text) {
-  if (/^AM[:\-]/i.test(text)) return 'AM';
-  if (/^PM[:\-]/i.test(text)) return 'PM';
-  // Heuristic: presence of "Sleep" => AM; presence of "Training" => PM
-  if (/\bSleep\b/i.test(text)) return 'AM';
-  if (/\bTraining\b/i.test(text)) return 'PM';
-  return 'UNKNOWN';
-}
-
-function todayISO(tz = 'Europe/London') {
-  const now = new Date();
-  const fmt = new Intl.DateTimeFormat('en-CA', { timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit' });
-  const [{ value: y },,{ value: m },,{ value: d }] = fmt.formatToParts(now);
-  return `${y}-${m}-${d}`; // YYYY-MM-DD
-}
-
-async function saveToAirtable(fields) {
-  const payload = { Date: todayISO(process.env.TIMEZONE || 'Europe/London'), Source: 'WhatsApp', ...fields };
-  return base(tableName).create([{ fields: payload }]);
-}
-
-async function sendReply(to, text) {
-  try {
-    await client.messages.create({
-      from: process.env.TWILIO_WHATSAPP_NUMBER,
-      to,
-      body: text
-    });
-  } catch (e) {
-    console.error('Twilio send error', e?.message);
-  }
-}
-
+// ---- handler ----
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+  // Quick check for routing: browser GET should show "up"
+  if (req.method !== 'POST') return res.status(200).send('up');
+
+  // Lazy-load deps *inside* the POST path so missing envs don't crash GET
+  const { default: Airtable } = await import('airtable');
+  const twilioMod = await import('twilio');
+  const twilio = twilioMod.default || twilioMod;
+
+  // Read env vars (must be set in Vercel → Settings → Environment Variables)
+  const {
+    AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME = 'Daily Logs',
+    TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER,
+    TIMEZONE = 'Europe/London', TWILIO_VALIDATE = 'false', TWILIO_WEBHOOK_URL
+  } = process.env;
+
+  // Minimal guardrails (better error in logs if something is missing)
+  if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) {
+    return res.status(500).send('Airtable env vars missing');
+  }
+  if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_NUMBER) {
+    return res.status(500).send('Twilio env vars missing');
+  }
+
+  const client = twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+  const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 
   const form = await parseForm(req);
-  if (!validateTwilioSignature(req, form)) {
-    return res.status(403).send('Invalid signature');
+
+  // Optional signature validation (keep off until your webhook URL is final)
+  if (TWILIO_VALIDATE === 'true') {
+    const sig = req.headers['x-twilio-signature'];
+    const url = TWILIO_WEBHOOK_URL;
+    const valid = twilio.validateRequest(TWILIO_AUTH_TOKEN, sig, url, form);
+    if (!valid) return res.status(403).send('Invalid signature');
   }
 
-  const incomingText = (form.Body || '').trim();
-  const from = form.From; // e.g., whatsapp:+44...
-
-  let entryType = detectEntryType(incomingText);
-  let fields = {};
+  const text = (form.Body || '').trim();
+  const from = form.From;
 
   try {
-    if (entryType === 'AM') fields = parseAM(incomingText);
-    else if (entryType === 'PM') fields = parsePM(incomingText);
-    else throw new Error('Could not detect AM/PM. Start message with "AM:" or "PM:"');
+    const type = detectEntryType(text);
+    const fields = type === 'AM' ? parseAM(text)
+                  : type === 'PM' ? parsePM(text)
+                  : (() => { throw new Error('Start with "AM:" or "PM:"'); })();
 
-    await saveToAirtable(fields);
+    const payload = { Date: todayISO(TIMEZONE), Source: 'WhatsApp', ...fields };
+    await base(AIRTABLE_TABLE_NAME).create([{ fields: payload }]);
 
-    const dateStr = todayISO(process.env.TIMEZONE || 'Europe/London');
-    await sendReply(from, `${fields.EntryType} check-in saved for ${dateStr}. ✅`);
+    await client.messages.create({
+      from: TWILIO_WHATSAPP_NUMBER,
+      to: from,
+      body: `${fields.EntryType} check-in saved for ${todayISO(TIMEZONE)}. ✅`
+    });
+
     return res.status(200).send('OK');
   } catch (e) {
-    console.error('Parse/save error', e?.message, incomingText);
-    await sendReply(from, `Sorry, I couldn't parse that. Please use your standard one-line format. Error: ${e?.message}`);
+    await client.messages.create({
+      from: TWILIO_WHATSAPP_NUMBER,
+      to: from,
+      body: `Sorry, couldn't parse it. Use your standard format. Error: ${e?.message}`
+    });
     return res.status(200).send('ERR');
   }
 }
