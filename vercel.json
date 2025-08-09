@@ -2,8 +2,6 @@
   "version": 2,
   "functions": {
     "api/**/*.js": { "runtime": "nodejs22.x" }
-  },
-  "routes": [
-    { "src": "/api/whatsapp", "dest": "/api/whatsapp.js" }
-  ]
+  }
 }
+
