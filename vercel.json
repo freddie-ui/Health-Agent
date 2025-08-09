@@ -1,0 +1,14 @@
+{
+  "version": 2,
+  "functions": {
+    "api/whatsapp.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
+  "routes": [
+    {
+      "src": "/api/whatsapp",
+      "dest": "/api/whatsapp.js"
+    }
+  ]
+}

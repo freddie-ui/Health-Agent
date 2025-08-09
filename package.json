@@ -1,0 +1,15 @@
+{
+  "name": "whatsapp-health-agent",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vercel dev",
+    "build": "echo 'No build step needed'",
+    "start": "node api/whatsapp.js"
+  },
+  "dependencies": {
+    "airtable": "^0.12.2",
+    "twilio": "^5.3.3"
+  }
+}
