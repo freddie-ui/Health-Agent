@@ -1,3 +1,1 @@
-export default function Home() {
-  return "ok";
-}
+export default function Home() { return "ok"; }
