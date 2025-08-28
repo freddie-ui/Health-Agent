@@ -1,6 +1,6 @@
 export const config = { api: { bodyParser: false } };
 
-// --- tiny helpers (safe to run without secrets) ---
+// ---- helpers (safe) ----
 async function parseForm(req) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -40,19 +40,64 @@ function todayISO(tz="Europe/London"){
 }
 
 export default async function handler(req, res) {
-  // GET in a browser should say "up"
-  if (req.method !== "POST") return res.status(200).send("up");
-
-  // Lazy-import deps so GET never crashes
-  const { default: Airtable } = await import("airtable");
-  const twilioMod = await import("twilio");
-  const twilio = twilioMod.default || twilioMod;
-
   const {
     AIRTABLE_API_KEY, AIRTABLE_BASE_ID, AIRTABLE_TABLE_NAME = "Daily Logs",
     TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_WHATSAPP_NUMBER,
     TIMEZONE = "Europe/London", TWILIO_VALIDATE = "false", TWILIO_WEBHOOK_URL
   } = process.env;
+
+  // ---- GET routes ----
+  if (req.method !== "POST") {
+    // diagnostics: GET ?diag=1
+    if (req.query && req.query.diag === "1") {
+      const report = { status: "diag", env: {}, airtable: {}, twilio: {} };
+      // env presence (no secrets leaked)
+      report.env = {
+        AIRTABLE_API_KEY: !!AIRTABLE_API_KEY,
+        AIRTABLE_BASE_ID: !!AIRTABLE_BASE_ID,
+        AIRTABLE_TABLE_NAME: !!AIRTABLE_TABLE_NAME,
+        TWILIO_ACCOUNT_SID: !!TWILIO_ACCOUNT_SID,
+        TWILIO_AUTH_TOKEN: !!TWILIO_AUTH_TOKEN,
+        TWILIO_WHATSAPP_NUMBER: !!TWILIO_WHATSAPP_NUMBER,
+        TIMEZONE
+      };
+      try {
+        const { default: Airtable } = await import("airtable");
+        if (AIRTABLE_API_KEY && AIRTABLE_BASE_ID) {
+          const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
+          // safe read (no write)
+          await base(AIRTABLE_TABLE_NAME).select({ maxRecords: 1 }).firstPage();
+          report.airtable.ok = true;
+        } else {
+          report.airtable.ok = false; report.airtable.error = "Missing env";
+        }
+      } catch (e) {
+        report.airtable.ok = false; report.airtable.error = String(e.message || e);
+      }
+      try {
+        const twilioMod = await import("twilio");
+        const twilio = twilioMod.default || twilioMod;
+        if (TWILIO_ACCOUNT_SID && TWILIO_AUTH_TOKEN) {
+          // init only (no API call)
+          twilio(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN);
+          report.twilio.ok = true;
+        } else {
+          report.twilio.ok = false; report.twilio.error = "Missing env";
+        }
+      } catch (e) {
+        report.twilio.ok = false; report.twilio.error = String(e.message || e);
+      }
+      return res.status(200).json(report);
+    }
+    // plain GET check
+    return res.status(200).send("up");
+  }
+
+  // ---- POST (live path) ----
+  // lazy imports
+  const { default: Airtable } = await import("airtable");
+  const twilioMod = await import("twilio");
+  const twilio = twilioMod.default || twilioMod;
 
   if (!AIRTABLE_API_KEY || !AIRTABLE_BASE_ID) return res.status(500).send("Airtable env vars missing");
   if (!TWILIO_ACCOUNT_SID || !TWILIO_AUTH_TOKEN || !TWILIO_WHATSAPP_NUMBER) return res.status(500).send("Twilio env vars missing");
@@ -61,7 +106,6 @@ export default async function handler(req, res) {
   const base = new Airtable({ apiKey: AIRTABLE_API_KEY }).base(AIRTABLE_BASE_ID);
 
   const form = await parseForm(req);
-
   if (TWILIO_VALIDATE === "true") {
     const sig = req.headers["x-twilio-signature"];
     const valid = twilio.validateRequest(TWILIO_AUTH_TOKEN, sig, TWILIO_WEBHOOK_URL, form);
@@ -73,21 +117,22 @@ export default async function handler(req, res) {
 
   try {
     const type = detectEntryType(text);
-    const fields = type === "AM" ? parseAM(text) :
-                   type === "PM" ? parsePM(text) :
-                   (()=>{ throw new Error('Start with "AM:" or "PM:"'); })();
+    const fields = type === "AM" ? parseAM(text)
+                  : type === "PM" ? parsePM(text)
+                  : (()=>{ throw new Error('Start with "AM:" or "PM:"'); })();
 
     const payload = { Date: todayISO(TIMEZONE), Source: "WhatsApp", ...fields };
     await base(AIRTABLE_TABLE_NAME).create([{ fields: payload }]);
 
     await client.messages.create({
-      from: TWILIO_WHATSAPP_NUMBER, // e.g., whatsapp:+14155238886 (sandbox sender)
-      to: from,                      // e.g., whatsapp:+447717320427 (you)
+      from: TWILIO_WHATSAPP_NUMBER, // e.g. whatsapp:+14155238886
+      to: from,                      // e.g. whatsapp:+4477...
       body: `${fields.EntryType} check-in saved for ${todayISO(TIMEZONE)}. ✅`
     });
 
     res.status(200).send("OK");
   } catch (e) {
+    console.error("handler error:", e?.message || e);
     await client.messages.create({
       from: TWILIO_WHATSAPP_NUMBER,
       to: from,
