@@ -9,6 +9,8 @@
   "dependencies": {
     "next": "14.2.5",
     "react": "18.3.1",
-    "react-dom": "18.3.1"
+    "react-dom": "18.3.1",
+    "airtable": "^0.12.2",
+    "twilio": "^5.3.3"
   }
 }
